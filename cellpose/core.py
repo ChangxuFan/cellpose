@@ -205,51 +205,109 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
     
     
-    # run multiple slices at the same time
-    ntiles = ny * nx
-    nimgs = max(1, batch_size // ntiles) # number of imgs to run in the same batch
-    niter = int(np.ceil(Lz / nimgs))
-    ziterator = (trange(niter, file=tqdm_out, mininterval=30) 
-                    if niter > 10 or Lz > 1 else range(niter))
-    for k in ziterator:
-        inds = np.arange(k * nimgs, min(Lz, (k + 1) * nimgs))
-        IMGa = np.zeros((ntiles * len(inds), nchan, ly, lx), "float32")
-        for i, b in enumerate(inds):
-            # pad image for net so Ly and Lx are divisible by 4
-            imgb = transforms.resize_image(imgi[b], rsz=rsz) if rsz is not None else imgi[b].copy()
-            imgb = np.pad(imgb.transpose(2,0,1), pads, mode="constant")
-            IMG, ysub, xsub, Lyt, Lxt = transforms.make_tiles(
-                imgb, bsize=bsize, augment=augment,
-                tile_overlap=tile_overlap)
-            IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
-                                            (ny * nx, nchan, ly, lx))
-        
-        # run network
-        for j in range(0, IMGa.shape[0], batch_size):
-            bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya0, stylea0 = _forward(net, IMGa[bslc])
-            if j == 0:
-                nout = ya0.shape[1]
-                ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
-                stylea = np.zeros((IMGa.shape[0], 256), "float32")
-            ya[bslc] = ya0
-            stylea[bslc] = stylea0
+    # Stream tiles per image to avoid preallocating all image tiles in RAM.
+    niter = Lz
+    ziterator = (trange(niter, file=tqdm_out, mininterval=30)
+                 if niter > 10 or Lz > 1 else range(niter))
+    nout = None
+    yf = None
+    styles = np.zeros((Lz, 256), "float32")
 
-        # average tiles
-        for i, b in enumerate(inds):
-            if i==0 and k==0:
+    for b in ziterator:
+        # pad image for net so Ly and Lx are divisible by 4
+        imgb = transforms.resize_image(imgi[b], rsz=rsz) if rsz is not None else imgi[b].copy()
+        imgb = np.pad(imgb.transpose(2, 0, 1), pads, mode="constant")
+
+        if augment:
+            if imgb.shape[1] < bsize:
+                imgb = np.concatenate((imgb, np.zeros((nchan, bsize - imgb.shape[1], imgb.shape[2]), dtype=imgb.dtype)), axis=1)
+            if imgb.shape[2] < bsize:
+                imgb = np.concatenate((imgb, np.zeros((nchan, imgb.shape[1], bsize - imgb.shape[2]), dtype=imgb.dtype)), axis=2)
+
+        Lyt, Lxt = imgb.shape[-2], imgb.shape[-1]
+        if augment:
+            bsizeY, bsizeX = int(bsize), int(bsize)
+            nyi = max(2, int(np.ceil(2. * Lyt / bsize)))
+            nxi = max(2, int(np.ceil(2. * Lxt / bsize)))
+        else:
+            tile_overlap_eff = min(0.5, max(0.05, tile_overlap))
+            bsizeY, bsizeX = np.int32(min(bsize, Lyt)), np.int32(min(bsize, Lxt))
+            nyi = 1 if Lyt <= bsize else int(np.ceil((1. + 2 * tile_overlap_eff) * Lyt / bsize))
+            nxi = 1 if Lxt <= bsize else int(np.ceil((1. + 2 * tile_overlap_eff) * Lxt / bsize))
+
+        ystart = np.linspace(0, Lyt - bsizeY, nyi).astype(int)
+        xstart = np.linspace(0, Lxt - bsizeX, nxi).astype(int)
+
+        ntiles_img = nyi * nxi
+        ysub = np.zeros((ntiles_img, 2), dtype=np.int32)
+        xsub = np.zeros((ntiles_img, 2), dtype=np.int32)
+        idx = 0
+        for j in range(nyi):
+            y0 = ystart[j]
+            y1 = y0 + bsizeY
+            for i in range(nxi):
+                x0 = xstart[i]
+                x1 = x0 + bsizeX
+                ysub[idx] = (y0, y1)
+                xsub[idx] = (x0, x1)
+                idx += 1
+
+        mask = transforms._taper_mask(ly=bsizeY, lx=bsizeX)
+        yfi = None
+        Navg = np.zeros((Lyt, Lxt), np.float32)
+
+        for j in range(0, ntiles_img, batch_size):
+            j1 = min(j + batch_size, ntiles_img)
+            bs = j1 - j
+            tile_batch = np.zeros((bs, nchan, bsizeY, bsizeX), "float32")
+
+            for t in range(bs):
+                ti = j + t
+                y0, y1 = ysub[ti]
+                x0, x1 = xsub[ti]
+                tile = imgb[:, y0:y1, x0:x1]
+                if augment:
+                    tj = ti // nxi
+                    tii = ti % nxi
+                    if tj % 2 == 0 and tii % 2 == 1:
+                        tile = tile[:, ::-1, :]
+                    elif tj % 2 == 1 and tii % 2 == 0:
+                        tile = tile[:, :, ::-1]
+                    elif tj % 2 == 1 and tii % 2 == 1:
+                        tile = tile[:, ::-1, ::-1]
+                tile_batch[t] = tile
+
+            ya0, _stylea0 = _forward(net, tile_batch)
+            if nout is None:
+                nout = ya0.shape[1]
                 yf = np.zeros((Lz, nout, Ly, Lx), "float32")
-                styles = np.zeros((Lz, 256), "float32")
-            y = ya[i * ntiles : (i + 1) * ntiles]
-            if augment:
-                y = np.reshape(y, (ny, nx, 3, ly, lx))
-                y = transforms.unaugment_tiles(y)
-                y = np.reshape(y, (-1, 3, ly, lx))
-            yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
-            yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
-            # stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
-            # stylei /= (stylei**2).sum()**0.5
-            # styles[b] = stylei
+            if yfi is None:
+                yfi = np.zeros((nout, Lyt, Lxt), np.float32)
+
+            for t in range(bs):
+                ti = j + t
+                y0, y1 = ysub[ti]
+                x0, x1 = xsub[ti]
+                ytile = ya0[t]
+                if augment:
+                    tj = ti // nxi
+                    tii = ti % nxi
+                    if tj % 2 == 0 and tii % 2 == 1:
+                        ytile = ytile[:, ::-1, :]
+                        ytile[0] *= -1
+                    elif tj % 2 == 1 and tii % 2 == 0:
+                        ytile = ytile[:, :, ::-1]
+                        ytile[1] *= -1
+                    elif tj % 2 == 1 and tii % 2 == 1:
+                        ytile = ytile[:, ::-1, ::-1]
+                        ytile[0] *= -1
+                        ytile[1] *= -1
+                yfi[:, y0:y1, x0:x1] += ytile * mask
+                Navg[y0:y1, x0:x1] += mask
+
+        yfi /= Navg
+        yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
+        # style remains all-zeros for compatibility with existing behavior.
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
     yf = yf.transpose(0,2,3,1)   

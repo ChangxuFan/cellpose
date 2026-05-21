@@ -4,7 +4,7 @@ Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer ,
 import os, time
 import numpy as np
 from tqdm import tqdm
-from cellpose import utils, models, io, train
+from cellpose import utils, models, io, train, transforms
 from .version import version_str
 from cellpose.cli import get_arg_parser
 
@@ -126,6 +126,9 @@ def main():
 
 
 def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_model, normalize):
+    if args.classifier_mode:
+        return _train_classifiermodel_cli(args, logger, image_filter, device, pretrained_model, normalize)
+
     test_dir = None if len(args.test_dir) == 0 else args.test_dir
     images, labels, image_names, train_probs = None, None, None, None
     test_images, test_labels, image_names_test, test_probs = None, None, None, None
@@ -178,6 +181,9 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
     if not args.train:
         saving_something = args.save_png or args.save_tif or args.save_flows or args.save_txt
 
+    if args.mip and (args.do_3D or args.stitch_threshold > 0.0):
+        raise ValueError("ERROR: --mip cannot be combined with --do_3D or --stitch_threshold > 0")
+
     tic = time.time()
     if len(args.dir) > 0:
         image_names = io.get_image_files(
@@ -197,6 +203,9 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
     logger.info(
             ">>>> running cellpose on %d images using all channels" % nimg)
 
+    if args.classifier_mode:
+        return _evaluate_classifiermodel_cli(args, logger, image_names, device, pretrained_model, normalize)
+
     # handle built-in model exceptions
     model = models.CellposeModel(device=device, pretrained_model=pretrained_model,)
 
@@ -205,7 +214,28 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
     channel_axis = args.channel_axis
     z_axis = args.z_axis
 
+    def _mip_axis(image, explicit_axis):
+        if explicit_axis is not None:
+            axis = explicit_axis if explicit_axis >= 0 else image.ndim + explicit_axis
+            if axis < 0 or axis >= image.ndim:
+                raise ValueError(f"ERROR: --mip_z_axis {explicit_axis} is out of bounds for shape {image.shape}")
+            return axis
+        # Default projection axis for OME-like stacks.
+        return 0
+
+    def _read_2d_image_for_eval(image_name):
+        if not args.mip:
+            return io.imread_2D(image_name)
+        image = io.imread(image_name)
+        axis = _mip_axis(image, args.mip_z_axis)
+        image = np.max(image, axis=axis)
+        logger.info(">>>> applied --mip on axis %d: projected to shape %s", axis, image.shape)
+        return transforms.convert_image(image, do_3D=False)
+
     for image_name in tqdm(image_names, file=tqdm_out):
+        eval_channel_axis = channel_axis
+        eval_z_axis = z_axis
+
         if args.do_3D or args.stitch_threshold > 0.:
             logger.info('loading image as 3D zstack')
 
@@ -215,12 +245,14 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
             else:
                 image = io.imread(image_name) # Rely on transforms.convert_image() to move channels inside of .eval()
             if channel_axis is None:
-                channel_axis = 3
+                eval_channel_axis = 3
             if z_axis is None:
-                z_axis = 0
+                eval_z_axis = 0
                 
         else:
-            image = io.imread_2D(image_name)
+            image = _read_2d_image_for_eval(image_name)
+            eval_channel_axis = None
+            eval_z_axis = None
         out = model.eval(
                 image, 
                 diameter=args.diameter, 
@@ -234,8 +266,8 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
                 bsize=args.bsize,
                 resample=not args.no_resample,
                 normalize=normalize,
-                channel_axis=channel_axis, 
-                z_axis=z_axis,
+                channel_axis=eval_channel_axis,
+                z_axis=eval_z_axis,
                 anisotropy=args.anisotropy, 
                 niter=args.niter,
                 flow3D_smooth=args.flow3D_smooth)
@@ -270,6 +302,156 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
             io.save_rois(masks, image_name)
     logger.info(">>>> completed in %0.3f sec" % (time.time() - tic))
 
+    return model
+
+
+def _infer_num_classes_from_labels(label_list):
+    if label_list is None or len(label_list) == 0:
+        raise ValueError("Cannot infer classifier_num_classes without labels")
+    max_id = 0
+    for lbl in label_list:
+        max_id = max(max_id, int(np.asarray(lbl).max()))
+    return max_id + 1
+
+
+def _train_classifiermodel_cli(args, logger, image_filter, device, pretrained_model, normalize):
+    from cellpose.nuclei_classifier.model_pixel_classifier import initialize_classifier_model
+    from cellpose.nuclei_classifier.train_classifier import train_classifier
+
+    test_dir = None if len(args.test_dir) == 0 else args.test_dir
+    if len(args.file_list) > 0:
+        raise NotImplementedError("classifier_mode currently does not support --file_list")
+
+    output = io.load_train_test_data(
+        args.dir,
+        test_dir,
+        image_filter,
+        args.mask_filter,
+        args.look_one_level_down,
+    )
+    images, labels, image_names, test_images, test_labels, image_names_test = output
+
+    n_classes = args.classifier_num_classes
+    if n_classes is None:
+        n_classes = _infer_num_classes_from_labels(labels)
+        logger.info(">>>> inferred classifier_num_classes=%d from training labels", n_classes)
+
+    model = initialize_classifier_model(
+        num_classes=n_classes,
+        predict_flows=bool(args.classifier_predict_flows),
+        pretrained_model=pretrained_model,
+        device=device,
+        use_bfloat16=False,
+    )
+
+    cpmodel_path = train_classifier(
+        model.net,
+        train_data=images,
+        train_labels=labels,
+        train_files=image_names,
+        test_data=test_images,
+        test_labels=test_labels,
+        test_files=image_names_test,
+        load_files=True,
+        normalize=normalize,
+        channel_axis=args.channel_axis,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        n_epochs=args.n_epochs,
+        batch_size=args.train_batch_size,
+        nimg_per_epoch=args.nimg_per_epoch,
+        nimg_test_per_epoch=args.nimg_test_per_epoch,
+        save_path=os.path.realpath(args.dir),
+        save_every=args.save_every,
+        save_each=args.save_each,
+        model_name=args.model_name_out,
+        compute_flows=bool(args.classifier_compute_flows),
+        flow_loss_weight=float(args.classifier_flow_weight),
+    )[0]
+
+    model.pretrained_model = cpmodel_path
+    logger.info(">>>> classifier model trained and saved to %s", cpmodel_path)
+    return model
+
+
+def _evaluate_classifiermodel_cli(args, logger, image_names, device, pretrained_model, normalize):
+    from cellpose.nuclei_classifier.model_pixel_classifier import initialize_classifier_model
+
+    n_classes = args.classifier_num_classes
+    if n_classes is None:
+        raise ValueError("--classifier_num_classes is required for classifier inference")
+
+    model = initialize_classifier_model(
+        num_classes=n_classes,
+        predict_flows=bool(args.classifier_predict_flows),
+        pretrained_model=pretrained_model,
+        device=device,
+        use_bfloat16=False,
+    )
+
+    if args.mip and args.do_3D:
+        raise ValueError("ERROR: --mip cannot be combined with --do_3D for classifier inference")
+
+    tic = time.time()
+    suffix = args.classifier_output_suffix if args.classifier_output_suffix is not None else "_cls"
+    out_dir = args.savedir if args.savedir else None
+
+    def _mip_axis(image, explicit_axis):
+        if explicit_axis is not None:
+            axis = explicit_axis if explicit_axis >= 0 else image.ndim + explicit_axis
+            if axis < 0 or axis >= image.ndim:
+                raise ValueError(f"ERROR: --mip_z_axis {explicit_axis} is out of bounds for shape {image.shape}")
+            return axis
+        return 0
+
+    def _read_classifier_image(image_name):
+        if not args.mip:
+            return io.imread_2D(image_name), args.channel_axis, args.z_axis
+
+        image = io.imread(image_name)
+        axis = _mip_axis(image, args.mip_z_axis)
+        image = np.max(image, axis=axis)
+        logger.info(">>>> applied --mip on axis %d: projected to shape %s", axis, image.shape)
+        image = transforms.convert_image(image, do_3D=False)
+        return image, None, None
+
+    def _custom_classifier_output_name(image_name):
+        if args.classifier_output_name is None:
+            stem, _ = os.path.splitext(os.path.basename(image_name))
+            return f"{stem}{suffix}.tif"
+
+        name = args.classifier_output_name
+        root, ext = os.path.splitext(name)
+        if ext == "":
+            ext = ".tif"
+
+        if len(image_names) == 1:
+            return f"{root}{ext}"
+
+        stem, _ = os.path.splitext(os.path.basename(image_name))
+        return f"{root}_{stem}{ext}"
+
+    tqdm_out = utils.TqdmToLogger(logger, level=logging.INFO)
+    for image_name in tqdm(image_names, file=tqdm_out):
+        image, eval_channel_axis, eval_z_axis = _read_classifier_image(image_name)
+        class_map, _, _, _ = model.eval(
+            image,
+            batch_size=args.batch_size,
+            channel_axis=eval_channel_axis,
+            z_axis=eval_z_axis,
+            normalize=normalize,
+            invert=args.invert,
+            rescale=None,
+            tile_overlap=0.1,
+            bsize=args.bsize,
+        )
+
+        if args.save_tif:
+            out_name = _custom_classifier_output_name(image_name)
+            out_path = os.path.join(out_dir, out_name) if out_dir else os.path.join(os.path.dirname(image_name), out_name)
+            io.imsave(out_path, class_map.astype(np.uint16))
+
+    logger.info(">>>> classifier inference completed in %0.3f sec", (time.time() - tic))
     return model
 
 

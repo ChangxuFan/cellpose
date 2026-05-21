@@ -49,6 +49,12 @@ def get_arg_parser():
         help="axis of image which corresponds to image channels")
     input_img_args.add_argument("--z_axis", default=None, type=int,
                                 help="axis of image which corresponds to Z dimension")
+    input_img_args.add_argument(
+        "--mip", action="store_true",
+        help="apply max-intensity projection before 2D evaluation (cannot be used with --do_3D)")
+    input_img_args.add_argument(
+        "--mip_z_axis", default=None, type=int,
+        help="axis used for --mip projection (defaults to axis 0 when not provided)")
     
     # TODO: remove deprecated in future version
     input_img_args.add_argument(
@@ -229,6 +235,27 @@ def get_arg_parser():
         "--model_name_out", default=None, type=str,
         help="Name of model to save as, defaults to name describing model architecture. "
         "Model is saved in the folder specified by --dir in models subfolder.")
+    training_args.add_argument(
+        "--classifier_mode", action="store_true",
+        help="use pixel-classifier pipeline (cellpose.nuclei_classifier.train_classifier)")
+    training_args.add_argument(
+        "--classifier_num_classes", default=None, type=int,
+        help="number of semantic classes including background (required for classifier inference)")
+    training_args.add_argument(
+        "--classifier_predict_flows", action="store_true",
+        help="classifier head includes optional flow outputs")
+    training_args.add_argument(
+        "--classifier_compute_flows", action="store_true",
+        help="during classifier training, derive instance flows from class masks")
+    training_args.add_argument(
+        "--classifier_flow_weight", default=1.0, type=float,
+        help="weight for optional flow loss in classifier training")
+    training_args.add_argument(
+        "--classifier_output_suffix", default="_cls", type=str,
+        help="suffix for classifier prediction tif outputs")
+    training_args.add_argument(
+        "--classifier_output_name", default=None, type=str,
+        help="custom output tif name for classifier inference (single-image mode)")
     
     # TODO: remove deprecated in future version
     training_args.add_argument(
